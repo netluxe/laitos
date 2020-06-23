@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/HouzuoGuo/laitos/hzgl"
 	"github.com/HouzuoGuo/laitos/lalog"
+	"github.com/HouzuoGuo/laitos/lambda"
 	"github.com/HouzuoGuo/laitos/launcher"
 	"github.com/HouzuoGuo/laitos/launcher/passwdserver"
 	"github.com/HouzuoGuo/laitos/misc"
@@ -40,7 +42,7 @@ func DecryptFile(filePath string) {
 		lalog.DefaultLogger.Abort("DecryptFile", "main", err, "failed to read password")
 		return
 	}
-	content, err := misc.Decrypt(filePath, []byte(password))
+	content, err := misc.Decrypt(filePath, strings.TrimSpace(string(password)))
 	if err != nil {
 		lalog.DefaultLogger.Abort("DecryptFile", "main", err, "failed to decrypt file")
 		return
@@ -67,7 +69,7 @@ func EncryptFile(filePath string) {
 		return
 	}
 	password = []byte(strings.TrimSpace(string(password)))
-	if err := misc.Encrypt(filePath, []byte(password)); err != nil {
+	if err := misc.Encrypt(filePath, password); err != nil {
 		lalog.DefaultLogger.Abort("EncryptFile", "main", err, "failed to encrypt file")
 		return
 	}
@@ -93,29 +95,37 @@ func StartPasswordWebServer(port int, url string) {
 }
 
 /*
-main runs one of several distinct routines as dictated by input command line flags:
+main runs one of several distinct routines according to the presented combination of command line flags:
 
-- Utilities for maintaining encrypted program data archive (-datautil=extract|archive).
+- Maintain encrypted program data files: -datautil=encrypt|decrypt
 
-- Data unlocker (password input server) that accepts a password input to launch laitos daemons in supervisor mode by decrypting its
-  program data (-pwdserver & -pwdserverport= & -pwdserverurl=).
+- Launch a simple web server to collect program data decryption password, and proceeds to launch laitos with supervisor:
+  -pwdserver -pwdserverport=12345 -pwdserverurl=/my-password-input-page
+	This routine is useful only if some program data files have been encrypted.
 
-- Supervisor runs laitos daemons in a seperate process and re-launches them in case of crash. Supervisor is turned on by
-  default (-supervisor=true).
+- Launch an AWS Lambda handler that proxies HTTP requests to laitos web server: -awslambda=true
+	This routine handles the requests in an independent goroutine, it is compatible with supervisor but incompatible with "-pwdserver".
 
-- Whether launched by supervisor or launched independently, start daemons (-config= & -daemons=).
+- Launch a supervisor that automatically restarts laitos main process in case of crash: -supervisor=true (already true by default)
+  This is the routine of choice for launching laitos as an OS daemon service.
 
-- Benchmark routine that runs after daemons have been launched.
+- Launch all specified daemons: -config c.json -daemons httpd,smtpd... -supervisor=false
+  Supervisor launches laitos main process this way.
+
+- Launch a benchmark routine that feeds random input to (nearly) all started daemons: -benchmark=true
+  This routine is occasionally used for fuzzy-test daemons.
+
 */
 func main() {
 	hzgl.HZGL()
 	// Process command line flags
 	var daemonList string
-	var disableConflicts, debug, benchmark bool
+	var disableConflicts, debug, benchmark, awsLambda bool
 	var gomaxprocs int
 	flag.StringVar(&misc.ConfigFilePath, launcher.ConfigFlagName, "", "(Mandatory) path to configuration file in JSON syntax")
 	flag.StringVar(&daemonList, launcher.DaemonsFlagName, "", "(Mandatory) comma-separated daemons to start (autounlock, dnsd, httpd, insecurehttpd, maintenance, plainsocket, serialport, simpleipsvcd, smtpd, snmpd, sockd, telegram)")
 	flag.BoolVar(&disableConflicts, "disableconflicts", false, "(Optional) automatically stop and disable other daemon programs that may cause port usage conflicts")
+	flag.BoolVar(&awsLambda, "awslambda", false, "(Optional) run AWS Lambda handler to proxy HTTP requests to laitos web server")
 	flag.BoolVar(&debug, "debug", false, "(Optional) print goroutine stack traces upon receiving interrupt signal")
 	flag.BoolVar(&benchmark, "benchmark", false, fmt.Sprintf("(Optional) continuously run benchmark routines on active daemons while exposing net/http/pprof on port %d", ProfilerHTTPPort))
 	flag.IntVar(&gomaxprocs, "gomaxprocs", 0, "(Optional) set gomaxprocs")
@@ -132,7 +142,7 @@ func main() {
 	flag.StringVar(&dataUtilFile, "datautilfile", "", "(Optional) program data encryption utility: encrypt/decrypt file location")
 	// Internal supervisor flag
 	var isSupervisor = true
-	flag.BoolVar(&isSupervisor, launcher.SupervisorFlagName, true, "(Internal use only) enter supervisor mode")
+	flag.BoolVar(&isSupervisor, launcher.SupervisorFlagName, true, "(Internal use only) launch a supervisor process to auto-restart laitos main process in case of crash")
 
 	flag.Parse()
 
@@ -160,6 +170,17 @@ func main() {
 			logger.Abort("main", "", nil, "please provide mode of operation (encrypt|decrypt) for parameter \"-datautil\"")
 		}
 		return
+	}
+
+	// ========================================================================
+	// AWS lambda handler starts an independent goroutine to proxy HTTP requests to laitos web server.
+	// ========================================================================
+	if awsLambda {
+		// Use environment variable PORT to tell HTTP (not HTTPS) server to listen on port expected by lambda handler
+		os.Setenv("PORT", strconv.Itoa(lambda.UpstreamWebServerPort))
+		// Unfortunately without encrypting program config file it is impossible to set LAITOS_HTTP_URL_ROUTE_PREFIX
+		handler := &lambda.Handler{}
+		go handler.StartAndBlock()
 	}
 
 	// ========================================================================
@@ -195,14 +216,20 @@ func main() {
 	}
 	if isEncrypted {
 		logger.Info("main", "", nil, "the configuration file is encrypted, please pipe or type decryption password followed by Enter (new-line).")
-		pwdReader := bufio.NewReader(os.Stdin)
-		pwd, err := pwdReader.ReadString('\n')
-		misc.UniversalDecryptionKey = []byte(strings.TrimSpace(pwd))
-		if err != nil {
-			logger.Abort("main", "", err, "failed to read password from stdin")
-			return
-		}
-		if configBytes, err = misc.Decrypt(misc.ConfigFilePath, misc.UniversalDecryptionKey); err != nil {
+		go func() {
+			// Collect program data decryption password from STDIN
+			pwdReader := bufio.NewReader(os.Stdin)
+			pwdFromStdin, err := pwdReader.ReadString('\n')
+			if err == nil {
+				misc.ProgramDataDecryptionPasswordInput <- strings.TrimSpace(pwdFromStdin)
+			} else {
+				logger.Warning("main", "", err, "failed to read decryption password from STDIN")
+			}
+		}()
+		// AWS lambda handler may also supply this password
+		pwd := <-misc.ProgramDataDecryptionPasswordInput
+		misc.ProgramDataDecryptionPassword = pwd
+		if configBytes, err = misc.Decrypt(misc.ConfigFilePath, misc.ProgramDataDecryptionPassword); err != nil {
 			logger.Abort("main", "", err, "failed to decrypt config file")
 			return
 		}

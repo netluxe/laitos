@@ -84,9 +84,6 @@ const (
 </html>`
 )
 
-// VirtualMachineISOFileDownloadPath is a location in file system where VM ISO file is saved in.
-var VirtualMachineISOFileDownloadPath = path.Join(os.TempDir(), "laitos-handle-virtual-machine-iso.iso")
-
 // HandleVirtualMachine is an HTTP handler that offers remote virtual machine controls, excluding the screenshot itself.
 type HandleVirtualMachine struct {
 	LocalUtilityPortNumber    int                             `json:"LocalUtilityPortNumber"`
@@ -152,6 +149,16 @@ func (handler *HandleVirtualMachine) parseSubmission(r *http.Request) (button, i
 	return
 }
 
+// getISODownloadLocation returns the file system location where downloaded OS ISO file is kept,.
+func (handler *HandleVirtualMachine) getISODownloadLocation() string {
+	// Prefer to use user's home directory over temp directory so that it won't be deleted when laitos restarts.
+	parentDir, _ := os.UserHomeDir()
+	if parentDir == "" {
+		parentDir = os.TempDir()
+	}
+	return path.Join(parentDir, ".laitos-remote-vm-iso-download.iso")
+}
+
 // Handle renders HTML page, reads user input from HTML form submission, and carries out corresponding VM control operations.
 func (handler *HandleVirtualMachine) Handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
@@ -167,21 +174,21 @@ func (handler *HandleVirtualMachine) Handle(w http.ResponseWriter, r *http.Reque
 		case "Refresh Screen":
 			// Simply re-render the page, including the screenshot. No extra action is required.
 		case "Download OS":
-			actionErr = errors.New(`Download is in progress, use "Refresh Screen" button to monitor the progress from Info output.`)
 			go func() {
-				_ = handler.VM.DownloadISO(isoURL, VirtualMachineISOFileDownloadPath)
+				_ = handler.VM.DownloadISO(isoURL, handler.getISODownloadLocation())
 			}()
+			actionErr = errors.New(`Download is in progress, use "Refresh Screen" button to monitor the progress from Info output.`)
 		case "Start":
 			// Kill the older VM (if it exists) and then start a new VM
 			handler.VM.Kill()
-			if _, isoErr := os.Stat(VirtualMachineISOFileDownloadPath); os.IsNotExist(isoErr) {
+			if _, isoErr := os.Stat(handler.getISODownloadLocation()); os.IsNotExist(isoErr) {
 				// If an ISO file does not yet exist, download the default Linux distribution.
 				actionErr = errors.New(`Downloading Linux distribution, use "Refresh Screen" to monitor the progress from Info output, and then press "Start" again.`)
 				go func() {
-					_ = handler.VM.DownloadISO(isoURL, VirtualMachineISOFileDownloadPath)
+					_ = handler.VM.DownloadISO(isoURL, handler.getISODownloadLocation())
 				}()
 			} else {
-				actionErr = handler.VM.Start(VirtualMachineISOFileDownloadPath)
+				actionErr = handler.VM.Start(handler.getISODownloadLocation())
 			}
 		case "Kill":
 			handler.VM.Kill()

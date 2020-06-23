@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -120,6 +121,9 @@ func (daemon *Daemon) Middleware(rateLimit *misc.RateLimit, restrictedRequestSiz
 		if rateLimit.Add(remoteIP, true) {
 			daemon.logger.Info("Handler", remoteIP, nil, "%s %s", r.Method, r.URL.Path)
 			next(w, r)
+			if r.Body != nil {
+				_ = r.Body.Close()
+			}
 		} else {
 			http.Error(w, "", http.StatusTooManyRequests)
 		}
@@ -127,8 +131,18 @@ func (daemon *Daemon) Middleware(rateLimit *misc.RateLimit, restrictedRequestSiz
 	}
 }
 
-// Check configuration and initialise internal states.
-func (daemon *Daemon) Initialise() error {
+/*
+Initialise validates configuration and initialises internal states.
+
+urlRoutePrefixKey is a URL prefix string that is expected to show up in every request made against this web server, it must begin with
+a forward slash and must not end with a forward slash.
+This often helps when some kind of API gateway (e.g. AWS API gateway) proxies visitors' requests and places a prefix string in each
+request (e.g. "/stageLive").
+If the prefix is given, the web server will automatically remove the prefix from incoming request URL, and subsequently match
+the requested URL to intended handler (e.g. "/stageLive/cmd-form" -> "/cmd-form").
+Web server will allow environment variable LAITOS_HTTP_URL_ROUTE_PREFIX to override the value configured here during initialisation.
+*/
+func (daemon *Daemon) Initialise(urlRoutePrefixKey string) error {
 	if daemon.Address == "" {
 		daemon.Address = "0.0.0.0"
 	}
@@ -157,6 +171,9 @@ func (daemon *Daemon) Initialise() error {
 	if (daemon.TLSCertPath != "" || daemon.TLSKeyPath != "") && (daemon.TLSCertPath == "" || daemon.TLSKeyPath == "") {
 		return errors.New("httpd.Initialise: missing TLS certificate or key path")
 	}
+	if urlRoutePrefixKey != "" {
+		daemon.logger.Info("Initialise", "", nil, "the URL route prefix string is \"%s\"", urlRoutePrefixKey)
+	}
 	// Install handlers with rate-limiting middleware
 	daemon.mux = new(http.ServeMux)
 	daemon.AllRateLimits = map[string]*misc.RateLimit{}
@@ -172,6 +189,7 @@ func (daemon *Daemon) Initialise() error {
 			if urlLocation[len(urlLocation)-1] != '/' {
 				urlLocation += "/"
 			}
+			urlLocation = urlRoutePrefixKey + urlLocation
 			rl := &misc.RateLimit{
 				UnitSecs: RateLimitIntervalSec,
 				MaxCount: DirectoryHandlerRateLimitFactor * daemon.PerIPLimit,
@@ -191,6 +209,7 @@ func (daemon *Daemon) Initialise() error {
 			MaxCount: hand.GetRateLimitFactor() * daemon.PerIPLimit,
 			Logger:   daemon.logger,
 		}
+		urlLocation = urlRoutePrefixKey + urlLocation
 		daemon.AllRateLimits[urlLocation] = rl
 		// With the exception of file upload handler, all handlers will be subject to a limited request size.
 		_, unrestrictedRequestSize := hand.(*handler.HandleFileUpload)
@@ -250,7 +269,7 @@ StartAndBlockWithTLS starts HTTP daemon and serve encrypted connections. Blocks 
 You may call this function only after having called Initialise()!
 */
 func (daemon *Daemon) StartAndBlockWithTLS() error {
-	contents, _, err := misc.DecryptIfNecessary(misc.UniversalDecryptionKey, daemon.TLSCertPath, daemon.TLSKeyPath)
+	contents, _, err := misc.DecryptIfNecessary(misc.ProgramDataDecryptionPassword, daemon.TLSCertPath, daemon.TLSKeyPath)
 	if err != nil {
 		return err
 	}
@@ -436,6 +455,19 @@ func TestAPIHandlers(httpd *Daemon, t testingstub.T) {
 		t.Fatal(err, resp.StatusCode, string(resp.Body))
 	}
 
+	// TTN HTTP hook (payload is 10 empty bytes + letters "ABC")
+	ttnUplinkPayload := base64.StdEncoding.EncodeToString([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 66, 67})
+	resp, err = inet.DoHTTP(inet.HTTPRequest{
+		Method: http.MethodPost,
+		Body:   strings.NewReader(fmt.Sprintf(`{"app_id": "test_app", "dev_id": "test_dev", "hardware_serial": "ttn-tx", "payload_raw": "%s"}`, ttnUplinkPayload)),
+	}, addr+httpd.GetHandlerByFactoryType(&handler.HandleTheThingsNetworkHTTPIntegration{}))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatal(err, string(resp.Body))
+	}
+	if reports := httpd.Processor.Features.MessageProcessor.GetLatestReportsFromSubject("test_dev", 1000); len(reports) != 1 {
+		t.Fatalf("%+v", reports)
+	}
+
 	// Twilio - exchange SMS with bad PIN
 	resp, err = inet.DoHTTP(inet.HTTPRequest{
 		Method: http.MethodPost,
@@ -614,7 +646,7 @@ over.]]></Say>`) {
 	httpd.Processor.Features.MessageProcessor.StoreReport(toolbox.SubjectReportRequest{
 		SubjectHostName: "subject-host-name",
 	}, "client-ip2", "client-daemon2")
-	// Retrieve both reports
+	// Retrieve TTN report + two host reports from the latest to oldest
 	var reports []toolbox.SubjectReport
 	resp, err = inet.DoHTTP(inet.HTTPRequest{Method: http.MethodPost}, addr+httpd.GetHandlerByFactoryType(&handler.HandleReportsRetrieval{}))
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -623,7 +655,7 @@ over.]]></Say>`) {
 	if err := json.Unmarshal(resp.Body, &reports); err != nil {
 		t.Fatal(err)
 	}
-	if len(reports) != 2 || reports[0].SubjectClientID != "client-ip2" || reports[1].SubjectClientID != "client-ip1" {
+	if len(reports) != 3 || reports[0].SubjectClientID != "client-ip2" || reports[1].SubjectClientID != "client-ip1" || reports[2].SubjectClientID != "ttn-tx" {
 		t.Fatalf("%+v", reports)
 	}
 	resp, err = inet.DoHTTP(inet.HTTPRequest{
@@ -647,7 +679,7 @@ over.]]></Say>`) {
 	if err != nil || resp.StatusCode != http.StatusOK || !strings.Contains(string(resp.Body), "will carry an app command") {
 		t.Fatal(err, string(resp.Body))
 	}
-	if cmd := httpd.Processor.Features.MessageProcessor.UpcomingSubjectCommand["subject-host-name"]; cmd != "test123" {
+	if cmd := httpd.Processor.Features.MessageProcessor.OutgoingAppCommands["subject-host-name"]; cmd != "test123" {
 		t.Fatal(cmd)
 	}
 }

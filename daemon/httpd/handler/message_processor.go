@@ -35,13 +35,25 @@ func (hand *HandleReportsRetrieval) Handle(w http.ResponseWriter, r *http.Reques
 
 	// endpoint/..?tohost=abc&cmd=xxxxxx
 	toHost := r.FormValue("tohost")
-	upcomingAppCmd := r.FormValue("cmd")
+	outgoingAppCmd := r.FormValue("cmd")
+	clearOutgoingCmd := r.FormValue("clear")
 	if toHost != "" {
-		hand.cmdProc.Features.MessageProcessor.SetUpcomingSubjectCommand(toHost, upcomingAppCmd)
 		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte(fmt.Sprintf(`OK, the next reply made in response to %s's report will carry an app command %d characters long.
-All upcoming commands:
-%+v`, toHost, len(upcomingAppCmd), hand.cmdProc.Features.MessageProcessor.GetAllUpcomingSubjectCommands())))
+		if clearOutgoingCmd == "" {
+			// Store a new outgoing command (?tohost=abc&cmd=xxxxx)
+			if outgoingAppCmd != "" {
+				hand.cmdProc.Features.MessageProcessor.SetOutgoingCommand(toHost, outgoingAppCmd)
+				_, _ = w.Write([]byte(fmt.Sprintf("The next reply made in response to %s's report will carry an app command %d characters long.\r\n", toHost, len(outgoingAppCmd))))
+			}
+		} else {
+			// Clear outgoing command for a host (?tohost=abc&clear=x)
+			hand.cmdProc.Features.MessageProcessor.SetOutgoingCommand(toHost, "")
+			_, _ = w.Write([]byte(fmt.Sprintf("Cleared outgoing command for host %s.\r\n", toHost)))
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf("All outgoing commands:\r\n")))
+		for host, cmd := range hand.cmdProc.Features.MessageProcessor.GetAllOutgoingCommands() {
+			_, _ = w.Write([]byte(fmt.Sprintf("%s: %v\r\n", host, cmd)))
+		}
 		return
 	}
 
